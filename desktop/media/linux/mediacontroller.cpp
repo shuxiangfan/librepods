@@ -1,8 +1,8 @@
-#include "mediacontroller.h"
+#include "../mediacontroller.h"
 #include "logger.h"
 #include "eardetection.hpp"
-#include "playerstatuswatcher.h"
-#include "pulseaudiocontroller.h"
+#include "../playerstatuswatcher.h"
+#include "../pulseaudiocontroller.h"
 
 #include <QDebug>
 #include <QProcess>

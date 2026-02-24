@@ -181,6 +181,7 @@ public:
         settings.setValue("magicAccIRK", magicAccIRK());
         settings.setValue("magicAccEncKey", magicAccEncKey());
         settings.setValue("hearingAidEnabled", hearingAidEnabled());
+        settings.setValue("bluetoothAddress", bluetoothAddress());
         settings.endGroup();
     }
     void loadFromSettings(const QSettings &settings)
@@ -190,6 +191,7 @@ public:
         setMagicAccIRK(settings.value("DeviceInfo/magicAccIRK", QByteArray()).toByteArray());
         setMagicAccEncKey(settings.value("DeviceInfo/magicAccEncKey", QByteArray()).toByteArray());
         setHearingAidEnabled(settings.value("DeviceInfo/hearingAidEnabled", false).toBool());
+        setBluetoothAddress(settings.value("DeviceInfo/bluetoothAddress", "").toString());
     }
 
     void updateBatteryStatus()

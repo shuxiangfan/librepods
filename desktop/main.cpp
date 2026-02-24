@@ -16,10 +16,16 @@
 #include <QLibraryInfo>
 #include <QDir>
 #include <QStandardPaths>
+#include <QSet>
 
 #include "airpods_packets.h"
 #include "logger.h"
-#include "media/mediacontroller.h"
+#ifdef Q_OS_WIN
+#include "media/windows/mediacontroller.h"
+#include "media/windows/windowsl2capsocket.h"
+#else
+#include "media/linux/mediacontroller.h"
+#endif
 #include "trayiconmanager.h"
 #include "enums.h"
 #include "battery.hpp"
@@ -32,6 +38,12 @@
 #include "systemsleepmonitor.hpp"
 
 using namespace AirpodsTrayApp::Enums;
+
+#ifdef Q_OS_WIN
+using AirPodsControlSocket = WindowsL2capSocket;
+#else
+using AirPodsControlSocket = QBluetoothSocket;
+#endif
 
 Q_LOGGING_CATEGORY(librepods, "librepods")
 
@@ -77,9 +89,11 @@ public:
         connect(mediaController, &MediaController::mediaStateChanged, this, &AirPodsTrayApp::handleMediaStateChange);
         mediaController->followMediaChanges();
 
+#ifndef Q_OS_WIN
         monitor = new BluetoothMonitor(this);
         connect(monitor, &BluetoothMonitor::deviceConnected, this, &AirPodsTrayApp::bluezDeviceConnected);
         connect(monitor, &BluetoothMonitor::deviceDisconnected, this, &AirPodsTrayApp::bluezDeviceDisconnected);
+#endif
 
         connect(m_bleManager, &BleManager::deviceFound, this, &AirPodsTrayApp::bleDeviceFound);
         connect(m_deviceInfo->getBattery(), &Battery::primaryChanged, this, &AirPodsTrayApp::primaryChanged);
@@ -91,7 +105,11 @@ public:
         setEarDetectionBehavior(loadEarDetectionSettings());
         setRetryAttempts(loadRetryAttempts());
 
-        monitor->checkAlreadyConnectedDevices();
+#ifndef Q_OS_WIN
+        if (monitor) {
+            monitor->checkAlreadyConnectedDevices();
+        }
+#endif
         LOG_INFO("AirPodsTrayApp initialized");
 
         QBluetoothLocalDevice localDevice;
@@ -151,8 +169,90 @@ private:
 
     void initializeDBus() { }
 
+#ifdef Q_OS_WIN
+    void startWindowsBluetoothConnectionWatcher()
+    {
+        if (m_windowsBluetoothPollTimer) {
+            return;
+        }
+
+        m_windowsBluetoothPollTimer = new QTimer(this);
+        m_windowsBluetoothPollTimer->setInterval(1500);
+        connect(m_windowsBluetoothPollTimer, &QTimer::timeout, this, [this]() {
+            pollWindowsBluetoothConnections();
+        });
+        m_windowsBluetoothPollTimer->start();
+        pollWindowsBluetoothConnections();
+        LOG_INFO("Windows Bluetooth connection watcher started");
+    }
+
+    void pollWindowsBluetoothConnections()
+    {
+        if (m_windowsL2capUnsupported) {
+            return;
+        }
+
+        QBluetoothLocalDevice localDevice;
+        const QList<QBluetoothAddress> connectedDevices = localDevice.connectedDevices();
+
+        QSet<QString> currentAddresses;
+        for (const QBluetoothAddress &address : connectedDevices) {
+            currentAddresses.insert(address.toString());
+        }
+
+        const QSet<QString> newAddresses = currentAddresses - m_windowsConnectedBluetoothAddresses;
+        const QSet<QString> removedAddresses = m_windowsConnectedBluetoothAddresses - currentAddresses;
+        m_windowsConnectedBluetoothAddresses = currentAddresses;
+
+        if (socket && socket->state() == QBluetoothSocket::SocketState::ConnectedState) {
+            const QString peer = socket->peerAddress().toString();
+            if (!peer.isEmpty() && removedAddresses.contains(peer)) {
+                onDeviceDisconnected(socket->peerAddress());
+            }
+        }
+
+        if (socket && socket->state() != QBluetoothSocket::SocketState::UnconnectedState) {
+            return;
+        }
+
+        const QString knownAirPodsAddress = m_deviceInfo ? m_deviceInfo->bluetoothAddress() : QString();
+
+        if (!knownAirPodsAddress.isEmpty() && currentAddresses.contains(knownAirPodsAddress)) {
+            LOG_DEBUG("Known AirPods address is connected on Windows: " << knownAirPodsAddress);
+            connectToDevice(knownAirPodsAddress);
+            return;
+        }
+
+        for (const QString &address : newAddresses) {
+            LOG_INFO("New Bluetooth device connected on Windows, probing AirPods service: " << address);
+            connectToDevice(address);
+            return;
+        }
+    }
+
+    void notifyWindowsL2capUnavailable()
+    {
+        if (m_windowsL2capUnavailableNotified) {
+            return;
+        }
+        m_windowsL2capUnavailableNotified = true;
+        if (trayManager) {
+            trayManager->showNotification(
+                "LibrePods (Windows)",
+                "AirPods controls require Bluetooth L2CAP, but your Windows Bluetooth driver does not support it (WSA 10044).");
+        }
+    }
+#endif
+
     bool isAirPodsDevice(const QBluetoothDeviceInfo &device)
     {
+#ifdef Q_OS_WIN
+        // On Windows, QBluetoothDeviceInfo built from an address usually lacks service UUIDs.
+        if (!m_deviceInfo->bluetoothAddress().isEmpty() &&
+            device.address().toString().compare(m_deviceInfo->bluetoothAddress(), Qt::CaseInsensitive) == 0) {
+            return true;
+        }
+#endif
         return device.serviceUuids().contains(QBluetoothUuid("74ec2172-0bad-4d01-8f77-997b2be0722a"));
     }
 
@@ -212,8 +312,9 @@ public slots:
         QByteArray packet = enabled ? AirPodsPackets::ConversationalAwareness::ENABLED
                                     : AirPodsPackets::ConversationalAwareness::DISABLED;
 
-        writePacketToSocket(packet, "Conversational awareness packet written: ");
-        m_deviceInfo->setConversationalAwareness(enabled);
+        if (writePacketToSocket(packet, "Conversational awareness packet written: ")) {
+            m_deviceInfo->setConversationalAwareness(enabled);
+        }
     }
 
     void setOneBudANCMode(bool enabled)
@@ -379,12 +480,21 @@ public slots:
         QByteArray packet = enabled ? AirPodsPackets::HearingAid::ENABLED
                                     : AirPodsPackets::HearingAid::DISABLED;
 
-        writePacketToSocket(packet, "Hearing aid packet written: ");
-        m_deviceInfo->setHearingAidEnabled(enabled);
+        if (writePacketToSocket(packet, "Hearing aid packet written: ")) {
+            m_deviceInfo->setHearingAidEnabled(enabled);
+        }
     }
 
     bool writePacketToSocket(const QByteArray &packet, const QString &logMessage)
     {
+#ifdef Q_OS_WIN
+        if (m_windowsL2capUnsupported)
+        {
+            LOG_ERROR("AirPods controls unavailable on this Windows system: Bluetooth L2CAP socket unsupported");
+            notifyWindowsL2capUnavailable();
+            return false;
+        }
+#endif
         if (socket && socket->isOpen())
         {
             socket->write(packet);
@@ -438,7 +548,11 @@ public slots:
         }
 
         // Also check for already connected devices via BlueZ
-        monitor->checkAlreadyConnectedDevices();
+#ifndef Q_OS_WIN
+        if (monitor) {
+            monitor->checkAlreadyConnectedDevices();
+        }
+#endif
     }
 
 private slots:
@@ -600,6 +714,17 @@ private slots:
 
     void connectToDevice(const QBluetoothDeviceInfo &device)
     {
+#ifdef Q_OS_WIN
+        if (m_windowsL2capUnsupported) {
+            static bool warnedOnce = false;
+            if (!warnedOnce) {
+                LOG_ERROR("AirPods control channel requires Bluetooth L2CAP, which Qt Bluetooth does not support on Windows in this build");
+                warnedOnce = true;
+            }
+            return;
+        }
+#endif
+
         if (socket && socket->isOpen() && socket->peerAddress() == device.address())
         {
             LOG_INFO("Already connected to the device: " << device.name());
@@ -616,13 +741,18 @@ private slots:
             socket = nullptr;
         }
 
-        QBluetoothSocket *localSocket = new QBluetoothSocket(QBluetoothServiceInfo::L2capProtocol);
+        AirPodsControlSocket *localSocket =
+#ifdef Q_OS_WIN
+            new AirPodsControlSocket(this);
+#else
+            new AirPodsControlSocket(QBluetoothServiceInfo::L2capProtocol);
+#endif
         socket = localSocket;
 
         // Connection handler
         auto handleConnection = [this, localSocket]()
         {
-            connect(localSocket, &QBluetoothSocket::readyRead, this, [this, localSocket]()
+            connect(localSocket, &AirPodsControlSocket::readyRead, this, [this, localSocket]()
                     {
             QByteArray data = localSocket->readAll();
             QMetaObject::invokeMethod(this, "parseData", Qt::QueuedConnection, Q_ARG(QByteArray, data));
@@ -634,6 +764,16 @@ private slots:
         auto handleError = [this, device, localSocket](QBluetoothSocket::SocketError error)
         {
             LOG_ERROR("Socket error: " << error << ", " << localSocket->errorString());
+
+#ifdef Q_OS_WIN
+            if (error == QBluetoothSocket::SocketError::UnsupportedProtocolError)
+            {
+                m_windowsL2capUnsupported = true;
+                LOG_ERROR("Windows backend cannot create the L2CAP socket required by AirPods on this system. Disabling further retries.");
+                notifyWindowsL2capUnavailable();
+                return;
+            }
+#endif
 
             static int retryCount = 0;
             if (retryCount < m_retryAttempts)
@@ -650,9 +790,13 @@ private slots:
             }
         };
 
-        connect(localSocket, &QBluetoothSocket::connected, this, handleConnection);
-        connect(localSocket, QOverload<QBluetoothSocket::SocketError>::of(&QBluetoothSocket::errorOccurred),
+        connect(localSocket, &AirPodsControlSocket::connected, this, handleConnection);
+#ifdef Q_OS_WIN
+        connect(localSocket, &AirPodsControlSocket::errorOccurred, this, handleError);
+#else
+        connect(localSocket, QOverload<QBluetoothSocket::SocketError>::of(&AirPodsControlSocket::errorOccurred),
                 this, handleError);
+#endif
 
         localSocket->connectToService(device.address(), QBluetoothUuid("74ec2172-0bad-4d01-8f77-997b2be0722a"));
         m_deviceInfo->setBluetoothAddress(device.address().toString());
@@ -760,6 +904,16 @@ private slots:
     }
 
     void connectToPhone() {
+#ifdef Q_OS_WIN
+        static bool warnedUnsupported = false;
+        if (!warnedUnsupported) {
+            LOG_WARN("Cross-device phone relay is not supported on Windows (Qt Bluetooth L2CAP unavailable)");
+            warnedUnsupported = true;
+        }
+        CrossDevice.isAvailable = false;
+        return;
+#endif
+
         if (!CrossDevice.isEnabled) {
             return;
         }
@@ -943,6 +1097,9 @@ public:
         connectToPhone();
 
         m_deviceInfo->loadFromSettings(*m_settings);
+#ifdef Q_OS_WIN
+        startWindowsBluetoothConnectionWatcher();
+#endif
         if (!areAirpodsConnected()) {
             m_bleManager->startScan();
         }
@@ -971,13 +1128,13 @@ signals:
     void hearingAidEnabledChanged(bool enabled);
 
 private:
-    QBluetoothSocket *socket = nullptr;
+    AirPodsControlSocket *socket = nullptr;
     QBluetoothSocket *phoneSocket = nullptr;
     QByteArray lastBatteryStatus;
     QByteArray lastEarDetectionStatus;
     MediaController* mediaController;
     TrayIconManager *trayManager;
-    BluetoothMonitor *monitor;
+    BluetoothMonitor *monitor = nullptr;
     QSettings *m_settings;
     AutoStartManager *m_autoStartManager;
     int m_retryAttempts = 3;
@@ -986,10 +1143,20 @@ private:
     BleManager *m_bleManager;
     SystemSleepMonitor *m_systemSleepMonitor = nullptr;
     QString m_phoneMacStatus;
+#ifdef Q_OS_WIN
+    QTimer *m_windowsBluetoothPollTimer = nullptr;
+    QSet<QString> m_windowsConnectedBluetoothAddresses;
+    bool m_windowsL2capUnsupported = false;
+    bool m_windowsL2capUnavailableNotified = false;
+#endif
 };
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
+
+#ifdef Q_OS_WIN
+    qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
+#endif
 
     // Load translations
     QTranslator *translator = new QTranslator(&app);
