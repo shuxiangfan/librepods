@@ -22,7 +22,7 @@
 #include "logger.h"
 #ifdef Q_OS_WIN
 #include "media/windows/mediacontroller.h"
-#include "media/windows/windowsl2capsocket.h"
+#include "media/windows/bumbleaacpsocket.h"
 #else
 #include "media/linux/mediacontroller.h"
 #endif
@@ -40,7 +40,7 @@
 using namespace AirpodsTrayApp::Enums;
 
 #ifdef Q_OS_WIN
-using AirPodsControlSocket = WindowsL2capSocket;
+using AirPodsControlSocket = BumbleAacpSocket;
 #else
 using AirPodsControlSocket = QBluetoothSocket;
 #endif
@@ -239,7 +239,9 @@ private:
         if (trayManager) {
             trayManager->showNotification(
                 "LibrePods (Windows)",
-                "AirPods controls require Bluetooth L2CAP, but your Windows Bluetooth driver does not support it (WSA 10044).");
+                m_windowsAirPodsBackendUnavailableReason.isEmpty()
+                    ? QStringLiteral("AirPods controls are unavailable on this Windows setup.")
+                    : m_windowsAirPodsBackendUnavailableReason);
         }
     }
 #endif
@@ -490,7 +492,7 @@ public slots:
 #ifdef Q_OS_WIN
         if (m_windowsL2capUnsupported)
         {
-            LOG_ERROR("AirPods controls unavailable on this Windows system: Bluetooth L2CAP socket unsupported");
+            LOG_ERROR("AirPods controls unavailable on this Windows system");
             notifyWindowsL2capUnavailable();
             return false;
         }
@@ -769,7 +771,20 @@ private slots:
             if (error == QBluetoothSocket::SocketError::UnsupportedProtocolError)
             {
                 m_windowsL2capUnsupported = true;
-                LOG_ERROR("Windows backend cannot create the L2CAP socket required by AirPods on this system. Disabling further retries.");
+                const QString backendError = localSocket->errorString();
+                if (backendError.contains("Python runtime not found", Qt::CaseInsensitive)) {
+                    m_windowsAirPodsBackendUnavailableReason =
+                        QStringLiteral("LibrePods Windows AirPods backend requires Python + Bumble. Install them, or set LIBREPODS_BUMBLE_HELPER_PYTHON.");
+                    LOG_ERROR("Bumble helper runtime is unavailable. Disabling further retries.");
+                } else if (backendError.contains("L2CAP", Qt::CaseInsensitive) || backendError.contains("WSA", Qt::CaseInsensitive)) {
+                    m_windowsAirPodsBackendUnavailableReason =
+                        QStringLiteral("AirPods controls require Bluetooth L2CAP, but your Windows Bluetooth driver does not support it (for example WSA 10044).");
+                    LOG_ERROR("Windows backend cannot create the L2CAP socket required by AirPods on this system. Disabling further retries.");
+                } else {
+                    m_windowsAirPodsBackendUnavailableReason =
+                        QStringLiteral("AirPods control backend is unavailable on this Windows setup.");
+                    LOG_ERROR("Windows AirPods backend unavailable. Disabling further retries.");
+                }
                 notifyWindowsL2capUnavailable();
                 return;
             }
@@ -1148,6 +1163,7 @@ private:
     QSet<QString> m_windowsConnectedBluetoothAddresses;
     bool m_windowsL2capUnsupported = false;
     bool m_windowsL2capUnavailableNotified = false;
+    QString m_windowsAirPodsBackendUnavailableReason;
 #endif
 };
 

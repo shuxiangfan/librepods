@@ -53,6 +53,8 @@ if (WIN32)
     list(APPEND LIBCROSSDS_SOURCES
             media/windows/audiocontroller.cpp
             media/windows/audiocontroller.h
+            media/windows/bumbleaacpsocket.cpp
+            media/windows/bumbleaacpsocket.h
             media/windows/mediacontroller.cpp
             media/windows/mediacontroller.h
             media/windows/windowsl2capsocket.cpp
@@ -117,6 +119,7 @@ if (WIN32)
             COMMAND "${WINDEPLOYQT_EXECUTABLE}" "$<$<CONFIG:Debug>:--debug>$<$<NOT:$<CONFIG:Debug>>:--release>" "$<TARGET_FILE:librepods>"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:OpenSSL::SSL>" "$<TARGET_FILE_DIR:librepods>"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:OpenSSL::Crypto>" "$<TARGET_FILE_DIR:librepods>"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/media/windows/bumble_aacp_helper.py" "$<TARGET_FILE_DIR:librepods>/bumble_aacp_helper.py"
             COMMENT "Deploying Qt runtime and OpenSSL DLLs for Windows"
             VERBATIM
         )
