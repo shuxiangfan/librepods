@@ -788,6 +788,17 @@ private slots:
                 notifyWindowsL2capUnavailable();
                 return;
             }
+
+            const QString backendError = localSocket->errorString();
+            if (backendError.contains("LIBUSB_ERROR_NOT_SUPPORTED", Qt::CaseInsensitive))
+            {
+                m_windowsL2capUnsupported = true;
+                m_windowsAirPodsBackendUnavailableReason =
+                    QStringLiteral("Switch your Bluetooth adapter driver to WinUSB for Bumble mode (current driver does not allow USB access).");
+                LOG_ERROR("Bumble cannot access the Bluetooth USB adapter (LIBUSB_ERROR_NOT_SUPPORTED). Disabling further retries.");
+                notifyWindowsL2capUnavailable();
+                return;
+            }
 #endif
 
             static int retryCount = 0;
